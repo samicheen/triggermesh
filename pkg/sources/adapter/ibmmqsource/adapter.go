@@ -31,7 +31,9 @@ import (
 	pkgadapter "knative.dev/eventing/pkg/adapter/v2"
 	"knative.dev/pkg/logging"
 
+	"github.com/triggermesh/triggermesh/pkg/apis/sources"
 	"github.com/triggermesh/triggermesh/pkg/apis/sources/v1alpha1"
+	"github.com/triggermesh/triggermesh/pkg/metrics"
 	"github.com/triggermesh/triggermesh/pkg/sources/adapter/ibmmqsource/mq"
 )
 
@@ -42,6 +44,8 @@ type ibmmqsourceAdapter struct {
 	logger   *zap.SugaredLogger
 
 	mqEnvs *SourceEnvAccessor
+
+	sr *metrics.EventProcessingStatsReporter
 }
 
 // NewAdapter returns adapter implementation
@@ -49,10 +53,20 @@ func NewAdapter(ctx context.Context, envAcc pkgadapter.EnvConfigAccessor, ceClie
 	env := envAcc.(*SourceEnvAccessor)
 	logger := logging.FromContext(ctx)
 
+	metrics.MustRegisterEventProcessingStatsView()
+
+	mt := &pkgadapter.MetricTag{
+		ResourceGroup: sources.IBMMQSourceResource.String(),
+		Namespace:     env.GetNamespace(),
+		Name:          env.GetName(),
+	}
+
 	return &ibmmqsourceAdapter{
 		ceClient: ceClient,
 		logger:   logger,
 		mqEnvs:   env,
+
+		sr: metrics.MustNewEventProcessingStatsReporter(mt),
 	}
 }
 
@@ -100,14 +114,19 @@ func (a *ibmmqsourceAdapter) eventHandler() mq.Handler {
 		if json.Valid(data) {
 			contentType = cloudevents.ApplicationJSON
 		}
+		ceTypeTag := metrics.TagEventType(event.Type())
+		ceSrcTag := metrics.TagEventSource(event.Source())
 		if err := event.SetData(contentType, data); err != nil {
 			a.logger.Errorf("Can't set Cloudevent data: %v", err)
+			a.sr.ReportProcessingError(false, ceTypeTag, ceSrcTag)
 			return err
 		}
 		if res := a.ceClient.Send(context.Background(), event); cloudevents.IsUndelivered(res) {
 			a.logger.Errorf("Cloudevent is not delivered: %v\n", res)
+			a.sr.ReportProcessingError(false, ceTypeTag, ceSrcTag)
 			return res
 		}
+		a.sr.ReportProcessingSuccess(ceTypeTag, ceSrcTag)
 		return nil
 	}
 }
